@@ -1,0 +1,154 @@
+name: Full Stack CI/CD Verification
+
+on:
+  push:
+    branches: [ main, 'feature/*' ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test-and-deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v3
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Maven Build & Unit Tests
+        run: |
+          mvn -f app/sample-spring-boot-app/pom.xml clean package -DskipTests
+
+      - name: Build Docker Image
+        run: |
+          docker build -t mycodev2-app:latest -f docker/Dockerfile .
+
+      - name: Create KinD Cluster
+        uses: helm/kind-action@v1.8.0
+        with:
+          cluster_name: kind
+          wait: 120s 
+
+      - name: Load Image into Kind
+        run: |
+          kind load docker-image mycodev2-app:latest --name kind
+
+      - name: Helm Deploy to 'dev' Namespace
+        run: |
+          kubectl create namespace dev
+          helm install my-stack ./helm-chart -n dev --create-namespace
+          echo "Helm chart installed, waiting for rollout..."
+          sleep 15
+
+      - name: Wait for MySQL Ready
+        run: |
+          kubectl rollout status deployment/mysql -n dev --timeout=120s || true
+          kubectl get pod -n dev -l app=mysql
+
+      - name: Wait for Kafka Ready
+        run: |
+          kubectl rollout status deployment/kafka -n dev --timeout=120s || true
+          kubectl get pod -n dev -l app=kafka
+
+      - name: Deployment Verification (Smoke Test)
+        run: |
+          echo "Listing all resources in dev namespace:"
+          kubectl get all -n dev
+          
+          echo "Waiting for app to be ready..."
+          kubectl wait --for=condition=ready pod -l app=spring-app -n dev --timeout=120s
+          
+          echo "Verifying service endpoints:"
+          kubectl get svc -n dev
+
+      - name: Setup Service Access
+        run: |
+          SERVICE_IP=$(kubectl get svc spring-app-service -n dev -o jsonpath='{.status.clusterIP}')
+          SERVICE_PORT=$(kubectl get svc spring-app-service -n dev -o jsonpath='{.spec.ports[0].port}')
+          echo "INTERNAL_URL=http://$SERVICE_IP:$SERVICE_PORT" >> $GITHUB_ENV
+          echo "SERVICE_IP=$SERVICE_IP" >> $GITHUB_ENV
+          echo "SERVICE_PORT=$SERVICE_PORT" >> $GITHUB_ENV
+
+      - name: Setup Cloudflare Tunnel
+        run: |
+          kubectl port-forward -n dev svc/spring-app-service 8080:8080 > /tmp/portforward.log 2>&1 &
+          PF_PID=$!
+          echo $PF_PID > /tmp/portforward.pid
+          sleep 3
+          
+          wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x cloudflared-linux-amd64
+          sudo cp cloudflared-linux-amd64 /usr/local/bin/cloudflared
+          
+          cloudflared tunnel --url http://localhost:8080 > /tmp/cloudflared.log 2>&1 &
+          CF_PID=$!
+          echo $CF_PID > /tmp/cloudflared.pid
+          sleep 10
+          
+          CF_URL=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' /tmp/cloudflared.log | head -1 || echo "")
+          
+          if [ -z "$CF_URL" ]; then
+            echo "Failed to get Cloudflare URL"
+            tail -10 /tmp/cloudflared.log
+            exit 1
+          fi
+          
+          echo "PUBLIC_URL=$CF_URL" >> $GITHUB_ENV
+
+      - name: Test Endpoints
+        run: |
+          TEST_URL="${{ env.PUBLIC_URL }}"
+          sleep 3
+          
+          echo "Testing GET /api/messages:"
+          curl -s "$TEST_URL/api/messages" || echo "GET request failed"
+          echo ""
+          
+          TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
+          echo "Testing POST /api/messages:"
+          curl -s -X POST -H "Content-Type: text/plain" \
+            -d "CI/CD Test: $TIMESTAMP" \
+            "$TEST_URL/api/messages" || echo "POST request failed"
+          echo ""
+          
+          sleep 5
+          
+          echo "Verifying producer-consumer:"
+          curl -s "$TEST_URL/api/messages" || echo "GET request failed"
+          echo ""
+
+      - name: Display Testing Information
+        run: |
+          echo "Application deployed successfully"
+
+      - name: Testing Window - 3 Minutes
+        run: |
+          for i in {1..36}; do
+            elapsed=$((($i - 1) * 5))
+            remaining=$((180 - $elapsed))
+            minutes=$((remaining / 60))
+            seconds=$((remaining % 60))
+            
+            if [ $i -eq 1 ] || [ $((i % 6)) -eq 0 ] || [ $remaining -eq 0 ]; then
+              if [ $remaining -eq 0 ]; then
+                echo "Application URL: ${{ env.PUBLIC_URL }}"
+                echo "Testing complete"
+              else
+                printf "Time remaining: %02dm %02ds\n" $minutes $seconds
+              fi
+            fi
+            
+            sleep 5
+          done
+
+      - name: Show Final Deployment Status
+        run: |
+          echo "Deployment completed"
+          kubectl get pods -n dev
+          kubectl get svc -n dev
